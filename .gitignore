@@ -1,0 +1,12 @@
+# Build artifacts
+*.tar.gz
+sing-box
+out/
+pkg/
+pkgc/
+dist/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,279 @@
+name: Build and Release Lite
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force build even if the lite release for this tag already exists'
+        required: false
+        type: boolean
+        default: false
+      custom_tag:
+        description: 'Upstream tag to build (e.g. v1.14.1-extended-2.7.2). Leave blank for the latest stable upstream release.'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: build-and-release-lite
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check Upstream Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      should_build: ${{ steps.check_step.outputs.should_build }}
+      upstream_tag: ${{ steps.check_step.outputs.upstream_tag }}
+      lite_tag: ${{ steps.check_step.outputs.lite_tag }}
+      version: ${{ steps.check_step.outputs.version }}
+    steps:
+      - name: Resolve tag and decide whether to build
+        id: check_step
+        run: |
+          set -euo pipefail
+          UPSTREAM_REPO="shtorm-7/sing-box-extended"
+
+          # releases/latest = latest stable (non-draft, non-prerelease) upstream release
+          LATEST_UPSTREAM_TAG=$(curl -fsSL \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest" | jq -r '.tag_name // empty')
+
+          if [ -z "$LATEST_UPSTREAM_TAG" ]; then
+            echo "::error::Failed to fetch the latest stable release tag of ${UPSTREAM_REPO}"
+            exit 1
+          fi
+          echo "Latest stable upstream tag: ${LATEST_UPSTREAM_TAG}"
+
+          CUSTOM_TAG="${{ github.event.inputs.custom_tag }}"
+          if [ -n "$CUSTOM_TAG" ]; then
+            TARGET_TAG="${CUSTOM_TAG}"
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${UPSTREAM_REPO}/releases/tags/${TARGET_TAG}")
+            if [ "$STATUS" != "200" ]; then
+              echo "::error::Custom tag ${TARGET_TAG} not found in ${UPSTREAM_REPO} (HTTP ${STATUS})"
+              exit 1
+            fi
+            echo "Using custom requested tag: ${TARGET_TAG}"
+          else
+            TARGET_TAG="${LATEST_UPSTREAM_TAG}"
+          fi
+
+          # Our tag = upstream tag + "-lite" suffix
+          LITE_TAG="${TARGET_TAG}-lite"
+          FORCE="${{ github.event.inputs.force_build }}"
+
+          TAG_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${LITE_TAG}" || true)
+          echo "Local release check for ${LITE_TAG}: HTTP ${TAG_STATUS}"
+
+          if [ "$TAG_STATUS" = "200" ] && [ "$FORCE" != "true" ]; then
+            echo "Release ${LITE_TAG} already exists in ${{ github.repository }}. Skipping build."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Triggering build for ${TARGET_TAG} -> ${LITE_TAG} (force: ${FORCE})"
+            {
+              echo "should_build=true"
+              echo "upstream_tag=${TARGET_TAG}"
+              echo "lite_tag=${LITE_TAG}"
+              echo "version=${LITE_TAG#v}"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build linux-${{ matrix.name }}
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: amd64
+            goarch: amd64
+          - name: arm64
+            goarch: arm64
+          - name: armv7
+            goarch: arm
+            goarm: '7'
+          - name: mips-softfloat
+            goarch: mips
+            gomips: softfloat
+          - name: mipsle-softfloat
+            goarch: mipsle
+            gomips: softfloat
+    steps:
+      - name: Checkout upstream sing-box-extended
+        uses: actions/checkout@v4
+        with:
+          repository: shtorm-7/sing-box-extended
+          ref: ${{ needs.check.outputs.upstream_tag }}
+          fetch-depth: 1
+          path: sing-box
+
+      - name: Setup Go (version from upstream go.mod)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: sing-box/go.mod
+          cache: false
+
+      - name: Install UPX
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends upx || sudo apt-get install -y --no-install-recommends upx-ucl
+          upx --version | head -n1
+
+      - name: Compile
+        working-directory: sing-box
+        run: |
+          set -xeuo pipefail
+          export GOOS=linux
+          export GOARCH=${{ matrix.goarch }}
+          if [ -n "${{ matrix.gomips }}" ]; then export GOMIPS="${{ matrix.gomips }}"; fi
+          if [ -n "${{ matrix.goarm }}" ]; then export GOARM="${{ matrix.goarm }}"; fi
+          export CGO_ENABLED=0
+
+          # Build tags: router essentials only (same proven set as MANCrimSon/sing-box-extended-lite)
+          BUILD_TAGS="with_quic,with_dhcp,with_wireguard,with_utls,with_clash_api,badlinkname,tfogo_checklinkname0"
+
+          # Version string = our tag without the leading "v", e.g. 1.14.1-extended-2.7.2-lite
+          LDFLAGS="-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.check.outputs.version }}' -X runtime.godebugDefault=multipathtcp=0,tlssha1=1 -checklinkname=0 -s -w -buildid="
+
+          echo "Building sing-box ${{ needs.check.outputs.version }} for linux/${{ matrix.name }} (GOARCH=$GOARCH)..."
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          go build -v -trimpath -tags "${BUILD_TAGS}" -ldflags "${LDFLAGS}" -o "$GITHUB_WORKSPACE/out/sing-box" ./cmd/sing-box
+
+          file "$GITHUB_WORKSPACE/out/sing-box"
+          ls -lh "$GITHUB_WORKSPACE/out/sing-box"
+
+      - name: Package (Pure ELF + UPX)
+        run: |
+          set -xeuo pipefail
+
+          # Pure ELF asset
+          mkdir -p pkg
+          cp out/sing-box pkg/sing-box
+          chmod 0755 pkg/sing-box
+          tar -czf "sing-box-extended-lite-linux-${{ matrix.name }}.tar.gz" -C pkg sing-box
+
+          # UPX-compressed asset
+          mkdir -p pkgc
+          cp out/sing-box pkgc/sing-box
+          chmod 0755 pkgc/sing-box
+          if ! upx --lzma pkgc/sing-box; then
+            echo "upx --lzma failed for ${{ matrix.name }}, retrying with upx -9 on a fresh copy..."
+            cp out/sing-box pkgc/sing-box
+            chmod 0755 pkgc/sing-box
+            upx -9 pkgc/sing-box
+          fi
+          file pkgc/sing-box
+          ls -lh pkgc/sing-box
+          tar -czf "sing-box-extended-lite-linux-${{ matrix.name }}-compressed.tar.gz" -C pkgc sing-box
+
+          ls -lh sing-box-extended-lite-linux-*.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.name }}
+          path: sing-box-extended-lite-linux-*.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+          path: dist
+
+      - name: Verify expected assets
+        run: |
+          set -euo pipefail
+          cd dist
+          MISSING=0
+          for arch in amd64 arm64 armv7 mips-softfloat mipsle-softfloat; do
+            for suffix in "" "-compressed"; do
+              f="sing-box-extended-lite-linux-${arch}${suffix}.tar.gz"
+              if [ ! -f "$f" ]; then
+                echo "::error::Missing asset ${f}"
+                MISSING=1
+              fi
+            done
+          done
+          if [ "$MISSING" != "0" ]; then exit 1; fi
+          ls -l
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum sing-box-extended-lite-*.tar.gz > sha256sums.txt
+          cat sha256sums.txt
+
+      - name: Prepare release notes
+        run: |
+          set -euo pipefail
+          UPSTREAM_TAG="${{ needs.check.outputs.upstream_tag }}"
+          VERSION="${{ needs.check.outputs.version }}"
+          BUILD_TAGS="with_quic,with_dhcp,with_wireguard,with_utls,with_clash_api,badlinkname,tfogo_checklinkname0"
+
+          {
+            echo "## sing-box-extended-lite ${VERSION}"
+            echo
+            echo "Built automatically from [shtorm-7/sing-box-extended](https://github.com/shtorm-7/sing-box-extended) tag \`${UPSTREAM_TAG}\`; see [README](https://github.com/${{ github.repository }}#readme)."
+            echo
+            echo "Version string baked into the binary: \`${VERSION}\` (the trailing \`-lite\` marks this as the lite build)."
+            echo
+            echo "### Build tags"
+            echo '```'
+            echo "${BUILD_TAGS}"
+            echo '```'
+            echo
+            echo "### Assets"
+            echo "Each archive contains a single \`sing-box\` binary (mode 0755). \`.tar.gz\` = pure ELF, \`-compressed.tar.gz\` = the same binary packed with UPX."
+            echo
+            echo "| Architecture | Pure ELF | UPX-compressed |"
+            echo "| :--- | ---: | ---: |"
+            cd dist
+            for arch in amd64 arm64 armv7 mips-softfloat mipsle-softfloat; do
+              ELF=$(stat -c%s "sing-box-extended-lite-linux-${arch}.tar.gz")
+              UPX=$(stat -c%s "sing-box-extended-lite-linux-${arch}-compressed.tar.gz")
+              printf '| `%s` | %s MB | %s MB |\n' "${arch}" \
+                "$(awk "BEGIN{printf \"%.1f\", ${ELF}/1048576}")" \
+                "$(awk "BEGIN{printf \"%.1f\", ${UPX}/1048576}")"
+            done
+            cd ..
+            echo
+            echo "Checksums for all assets: \`sha256sums.txt\`."
+          } > release_notes.md
+
+          cat release_notes.md
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check.outputs.lite_tag }}
+          name: sing-box-extended-lite ${{ needs.check.outputs.lite_tag }}
+          draft: false
+          prerelease: false
+          generate_release_notes: false
+          body_path: release_notes.md
+          files: |
+            dist/*
